@@ -1,134 +1,253 @@
-# -*- coding: utf-8 -*-
-"""
-media_uploader.py - Handles uploading media assets specifically for WeChat.
+# /Users/junluo/Documents/auto_work_publishment_for_wechat_article/src/platforms/wechat/media_uploader.py
 
-Responsibilities:
-- Take local file paths for media (images, videos).
-- Use the WeChatAPIClient to upload these files to WeChat servers.
-- Return the WeChat media_id for each uploaded asset.
-- Abstract the media type determination logic (basic version here).
+"""
+Refined WeChat Media Uploading Module
+
+Purpose:
+Handles uploading media files (cover, content) to WeChat, using the richer
+information provided by the refined Article model (frontmatter metadata,
+explicit file paths from standard Markdown links).
 
 Dependencies:
-- logging: For logging upload process.
-- src.api.wechat.client: The client used for actual API communication.
-- typing: For type hints.
+- typing (standard Python library)
+- pathlib (standard Python library)
+- src.api.wechat.client.WeChatClient
+- src.core.article_model.Article
+- src.core.settings
+- src.utils.logger
 
 Expected Input:
-- wechat_api_client: An instance of WeChatAPIClient.
-- local_file_path (str): Path to the media file on the local system.
+- An Article object populated by the refined MarkdownParser.
+- A WeChatClient instance.
+- Configuration settings (media mode, paths).
 
 Expected Output:
-- str: The WeChat media_id for the uploaded asset.
+- Updates the Article object's placeholders with upload results (media_id, url).
+- Returns True if cover upload succeeds, False otherwise (content media failures only logged).
 """
 
-import logging
-import os
-from typing import TYPE_CHECKING
+from typing import Dict, Optional, Tuple
+from pathlib import Path
 
-# Use TYPE_CHECKING to avoid circular imports for type hints
-if TYPE_CHECKING:
-    from src.api.wechat.client import WeChatAPIClient, WeChatAPIError
-    from requests.exceptions import RequestException
-
-logger = logging.getLogger(__name__)
+from src.api.wechat.client import WeChatClient
+from src.core.article_model import Article, MediaPlaceholder
+from src.core import settings
+from src.utils.logger import log
 
 class WeChatMediaUploader:
-    """Handles the process of uploading media files to WeChat."""
+    """Handles uploading media associated with an Article to WeChat."""
 
-    def __init__(self, api_client: 'WeChatAPIClient'):
+    def __init__(self, client: WeChatClient):
         """
         Initializes the media uploader.
 
         Args:
-            api_client (WeChatAPIClient): An initialized WeChat API client instance.
+            client (WeChatClient): An authenticated WeChat API client instance.
         """
-        self.api_client = api_client
-        # Define supported extensions (can be expanded)
-        self.image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp']
-        self.video_extensions = ['.mp4'] # WeChat has strict format/size limits
-        self.thumb_extensions = self.image_extensions # Thumbs are usually images
-        # Add voice extensions if needed: ['.amr', '.mp3']
+        self.client = client
+        log.info("WeChatMediaUploader initialized.")
 
-    def _determine_media_type(self, file_path: str) -> str:
+    def upload_article_media(self, article: Article) -> bool:
         """
-        Determines the WeChat media type based on file extension.
+        Uploads the cover image and all content media referenced in the article.
+        Updates the MediaPlaceholder objects within the article with upload results.
 
         Args:
-            file_path (str): Path to the media file.
+            article (Article): The article object containing media references.
 
         Returns:
-            str: The determined media type ('image', 'video', 'thumb', 'voice') or raises ValueError.
+            bool: True if the cover image upload was successful, False otherwise.
+                  Failures in content media uploads are logged but do not cause a False return.
         """
-        _, ext = os.path.splitext(file_path)
-        ext_lower = ext.lower()
+        log.info(f"Starting media upload process for article: '{article.title}'")
+        upload_success_count = 0
+        upload_failure_count = 0
 
-        if ext_lower in self.image_extensions:
-            # Simple logic: treat all images as 'image' for draft content uploads.
-            # If specific thumbnail uploads are needed, add logic here or pass type explicitly.
-            return 'image'
-        elif ext_lower in self.video_extensions:
-            return 'video'
-        # Add voice logic if needed
-        # elif ext_lower in self.voice_extensions:
-        #    return 'voice'
+        # --- 1. Handle Cover Image Upload ---
+        cover_success = self._upload_cover_image(article)
+        if not cover_success:
+            log.critical("Critical failure: Cover image upload failed. Halting media upload for this article.")
+            return False # Cover image is mandatory
+
+        upload_success_count += 1 # Count cover as one success
+
+        # --- 2. Handle Content Media Uploads ---
+        log.info("Processing content media uploads...")
+        if not article.media_placeholders:
+            log.info("No content media references found in the article.")
         else:
-            logger.error(f"Unsupported file extension '{ext}' for WeChat upload: {file_path}")
-            raise ValueError(f"Unsupported media file extension: {ext}")
+            for placeholder in article.media_placeholders:
+                if placeholder.uploaded_media_id:
+                    log.debug(f"Skipping already uploaded media: {placeholder.placeholder_id}")
+                    upload_success_count +=1
+                    continue
 
-    def upload_media(self, local_file_path: str) -> str:
+                # Determine the absolute path of the media file
+                media_file_path = self._find_media_file(placeholder, is_cover=False, article_base_dir=settings.INPUT_DIR) # Assume article path relative to INPUT_DIR
+
+                if not media_file_path:
+                    log.warning(f"Could not find file for content media placeholder ID='{placeholder.placeholder_id}', Path='{placeholder.file_path}'. Skipping upload.")
+                    upload_failure_count += 1
+                    continue # Skip this file
+
+                # Perform the upload (Content images/videos are usually permanent)
+                media_type = placeholder.media_type # 'image', 'video', etc. (set by parser)
+                log.info(f"Uploading content media ({media_type}) from: {media_file_path}")
+                upload_result = self.client.upload_media(
+                    file_path=str(media_file_path),
+                    media_type=media_type,
+                    is_permanent=True # Content media should typically be permanent
+                )
+
+                if upload_result and 'media_id' in upload_result:
+                    placeholder.uploaded_media_id = upload_result['media_id']
+                    placeholder.uploaded_url = upload_result.get('url') # URL is important!
+                    log.info(f"Content media '{placeholder.placeholder_id}' uploaded. Media ID: {placeholder.uploaded_media_id}, URL: {placeholder.uploaded_url}")
+                    upload_success_count += 1
+                else:
+                    log.error(f"Failed to upload content media: {media_file_path} (Placeholder ID: {placeholder.placeholder_id})")
+                    upload_failure_count += 1
+                    # Continue trying other media
+
+        # --- 3. Log Summary ---
+        total_media = 1 + len(article.media_placeholders) # Cover + Content
+        log.info(f"Media upload process finished for article: '{article.title}'.")
+        log.info(f"Upload Summary: {upload_success_count} succeeded, {upload_failure_count} failed (out of {total_media} total media items).")
+        if upload_failure_count > 0:
+            log.warning("There were failures uploading some content media items. Check logs above.")
+
+        # Return True because cover succeeded (content failures don't block)
+        return True
+
+
+    def _upload_cover_image(self, article: Article) -> bool:
         """
-        Uploads a single media file to WeChat as temporary media.
+        Finds and uploads the cover image specified for the article.
+        Prioritizes frontmatter references.
 
         Args:
-            local_file_path (str): The path to the local media file.
+            article (Article): The article object.
 
         Returns:
-            str: The WeChat media_id for the uploaded file.
-
-        Raises:
-            FileNotFoundError: If the file doesn't exist.
-            ValueError: If the media type is unsupported.
-            WeChatAPIError: If the API reports an error during upload.
-            RequestException: For network issues during upload.
+            bool: True if cover upload was successful, False otherwise.
         """
-        logger.info(f"Preparing to upload media file: {local_file_path}")
+        log.info("Processing cover image upload...")
+        cover_file_path: Optional[Path] = None
+        cover_placeholder = article.cover_image_placeholder # May contain ID and/or relative path
 
-        if not os.path.exists(local_file_path):
-            logger.error(f"Local media file not found: {local_file_path}")
-            raise FileNotFoundError(f"Local media file not found: {local_file_path}")
+        if not cover_placeholder and not article.cover_image_file_path:
+             log.error("No cover image reference found in article frontmatter ('cover_image' or 'cover_image_path'). Cannot determine cover image.")
+             # Add fallback logic here if desired (e.g., check settings.INPUT_COVER_IMAGE_DIR)
+             log.warning(f"Attempting fallback: Searching for cover image in {settings.INPUT_COVER_IMAGE_DIR}")
+             try:
+                # Example fallback: look for file matching article title or first image
+                 potential_path = settings.INPUT_COVER_IMAGE_DIR / f"{article.title}.jpg"
+                 if potential_path.is_file():
+                     cover_file_path = potential_path
+                 else:
+                     potential_path = settings.INPUT_COVER_IMAGE_DIR / f"{article.title}.png"
+                     if potential_path.is_file():
+                         cover_file_path = potential_path
+                     else: # Last resort: first file
+                        first_img = next(settings.INPUT_COVER_IMAGE_DIR.glob('*.*'))
+                        cover_file_path = first_img
+                 log.info(f"Using fallback cover image: {cover_file_path}")
+                 # Create a placeholder object for the fallback if needed for consistency
+                 if not cover_placeholder:
+                      cover_placeholder = MediaPlaceholder(placeholder_id=cover_file_path.name, media_type="thumb")
+                      article.cover_image_placeholder = cover_placeholder # Add to article
+             except StopIteration:
+                 log.error(f"Fallback failed: No cover image found in {settings.INPUT_COVER_IMAGE_DIR}.")
+                 return False # Cannot proceed without cover
 
-        try:
-            # Determine media type based on extension
-            media_type = self._determine_media_type(local_file_path)
-            logger.debug(f"Determined media type as '{media_type}' for {local_file_path}")
 
-            # Use the API client to perform the upload
-            media_id = self.api_client.upload_temporary_media(local_file_path, media_type)
-            logger.info(f"Media upload successful for {local_file_path}. Media ID: {media_id}")
-            return media_id
+        # If we don't have an absolute path yet, find it using the placeholder/path info
+        if not cover_file_path:
+            # Base directory for resolving cover paths could be INPUT_DIR or specific cover dir
+            cover_base_dir = settings.INPUT_COVER_IMAGE_DIR # Usually covers are here
+            cover_file_path = self._find_media_file(
+                placeholder=cover_placeholder,
+                explicit_relative_path=article.cover_image_file_path,
+                is_cover=True,
+                article_base_dir=cover_base_dir # Resolve relative to cover dir
+            )
 
-        except (FileNotFoundError, ValueError, 'WeChatAPIError', 'RequestException') as e:
-            logger.error(f"Media upload failed for {local_file_path}: {e}", exc_info=False) # Avoid redundant stack trace if already logged in client
-            raise # Re-raise the exception to be handled by the caller
+        if not cover_file_path:
+            log.error(f"Could not find the specified cover image file. Placeholder: {cover_placeholder}, Path: {article.cover_image_file_path}")
+            return False
 
-# --- Explanation ---
-# Purpose: To abstract the specific logic of uploading media files *for WeChat*.
-#          It acts as an intermediary between the publisher (which knows about
-#          local files) and the API client (which knows how to talk to the API).
-# Design Choices:
-# - Takes an initialized `WeChatAPIClient` instance upon creation (Dependency Injection).
-#   This makes it testable, as you can pass a mock API client during tests.
-# - Includes a basic `_determine_media_type` helper based on file extensions. This
-#   is simple but might need refinement for edge cases or specific WeChat requirements
-#   (e.g., differentiating 'thumb' uploads if needed).
-# - The main `upload_media` method orchestrates: checking file existence, determining
-#   type, and calling the appropriate API client method.
-# - It focuses on uploading *temporary* media, suitable for draft creation. Permanent
-#   media upload would likely require a separate method or different logic.
-# Improvements/Alternatives:
-# - **Media Type Determination:** Could be made more robust, perhaps by inspecting
-#   file headers (using libraries like `python-magic`) or by requiring the type
-#   to be passed explicitly if extension isn't reliable.
-# - **Error Handling:** Could potentially add retries for temporary network errors.
-# - **Permanent Media:** Add a separate `upload_permanent_media` method if needed.
-# - **Configuration:** Media type mappings (extensions) could be moved to `config.ini`.
+        # Ensure the placeholder exists in the article for storing results
+        if not article.cover_image_placeholder:
+             article.cover_image_placeholder = MediaPlaceholder(placeholder_id=cover_file_path.name, media_type="thumb")
+
+        # Perform the upload (Covers *must* be 'thumb' type for WeChat drafts)
+        log.info(f"Uploading cover image ('thumb') from: {cover_file_path}")
+        upload_result = self.client.upload_media(
+            file_path=str(cover_file_path),
+            media_type='thumb', # Hardcoded to thumb for cover
+            is_permanent=True # Often required for `thumb_media_id` in drafts
+        )
+
+        if upload_result and 'media_id' in upload_result:
+            # Store results back into the placeholder object within the article
+            article.cover_image_placeholder.uploaded_media_id = upload_result['media_id']
+            article.cover_image_placeholder.uploaded_url = upload_result.get('url')
+            article.cover_image_placeholder.file_path = str(cover_file_path) # Store resolved path
+            log.info(f"Cover image uploaded successfully. Media ID: {article.cover_image_placeholder.uploaded_media_id}")
+            return True
+        else:
+            log.error(f"Failed to upload cover image: {cover_file_path}")
+            return False
+
+
+    def _find_media_file(self,
+                         placeholder: Optional[MediaPlaceholder],
+                         explicit_relative_path: Optional[str] = None,
+                         is_cover: bool = False,
+                         article_base_dir: Path = settings.INPUT_DIR) -> Optional[Path]:
+        """
+        Finds the absolute path for a media item based on placeholder info or explicit path.
+
+        Args:
+            placeholder (Optional[MediaPlaceholder]): The placeholder object from the article.
+            explicit_relative_path (Optional[str]): An explicit relative path (e.g., from cover_image_path).
+            is_cover (bool): Flag indicating if this is the cover image.
+            article_base_dir (Path): The base directory to resolve relative paths against.
+                                     (e.g., settings.INPUT_DIR or settings.INPUT_COVER_IMAGE_DIR)
+
+        Returns:
+            Optional[Path]: The resolved absolute path to the media file, or None if not found.
+        """
+        # Priority 1: Use explicit relative path if provided (e.g., standard MD link or cover_image_path)
+        target_path_str = explicit_relative_path or (placeholder.file_path if placeholder else None)
+        if target_path_str:
+            try:
+                # Resolve relative path based on the article's input directory
+                # Security note: Ensure article_base_dir is trusted / within project
+                resolved_path = (article_base_dir / target_path_str).resolve()
+                if resolved_path.is_file():
+                    log.debug(f"Found media file via relative path '{target_path_str}': {resolved_path}")
+                    return resolved_path
+                else:
+                    log.warning(f"Media file specified by path '{target_path_str}' not found at resolved location: {resolved_path}")
+                    # Fall through to try finding by ID if path fails
+            except Exception as e:
+                 log.warning(f"Error resolving media path '{target_path_str}': {e}. Trying lookup by ID.")
+                 # Fall through
+
+        # Priority 2: Look for file by placeholder ID in the designated directory
+        if placeholder and placeholder.placeholder_id:
+            media_dir = settings.INPUT_COVER_IMAGE_DIR if is_cover else settings.INPUT_CONTENT_IMAGE_DIR
+            potential_path = media_dir / placeholder.placeholder_id
+            if potential_path.is_file():
+                log.debug(f"Found media file via placeholder ID '{placeholder.placeholder_id}' in {media_dir}: {potential_path}")
+                return potential_path
+            else:
+                # Try adding common extensions if ID has none? Could be risky.
+                log.warning(f"Media file not found by matching placeholder ID '{placeholder.placeholder_id}' in directory {media_dir}")
+
+        # Priority 3: (Optional / Fallback for cover only in _upload_cover_image)
+        # Could add more fallbacks here if needed
+
+        log.debug(f"Could not find file for placeholder: {placeholder}, explicit path: {explicit_relative_path}")
+        return None

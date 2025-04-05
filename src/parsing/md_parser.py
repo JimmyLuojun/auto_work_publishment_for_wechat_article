@@ -1,243 +1,339 @@
-# -*- coding: utf-8 -*-
-"""
-md_parser.py - Parses Markdown files into Article objects.
+# /Users/junluo/Documents/auto_work_publishment_for_wechat_article/src/parsing/md_parser.py
 
-Responsibilities:
-- Read content from a given Markdown file path.
-- Parse the Markdown syntax using a suitable library.
-- Extract title, content blocks (paragraphs, headings, images, code),
-  and potentially frontmatter metadata.
-- Construct and return an Article object (defined in src.core.article_model).
+"""
+Refined Markdown Parsing Module with Frontmatter Support
+
+Purpose:
+Reads a Markdown file, parses YAML frontmatter for metadata (title, cover image, etc.),
+parses the Markdown content into HTML, identifies both custom `placeholder:` tags
+and standard Markdown image links as media placeholders, and populates a comprehensive
+Article data model.
 
 Dependencies:
-- os: For path manipulation (finding images relative to the markdown file).
-- logging: For logging parsing process and errors.
-- markdown_it: Recommended Markdown parsing library (or 'markdown').
-- src.core.article_model: Defines the Article and ContentBlock structures.
-- typing: For type hints.
+- frontmatter (external library)
+- markdown (external library) - Potentially with extensions
+- re (standard Python library)
+- typing (standard Python library)
+- pathlib (standard Python library)
+- src.core.article_model
+- src.core.settings
+- src.utils.logger
 
-Expected Input:
-- file_path (str): Path to the input Markdown file.
-
-Expected Output:
-- Article: An instance of the Article class populated with parsed content.
+Expected Input: Path to a Markdown file, potentially containing YAML frontmatter.
+Expected Output: An instance of the Article data model populated with metadata and content.
 """
 
-import logging
-import os
-from typing import List, Optional, Tuple
+import re
+import markdown
+import frontmatter # For parsing YAML frontmatter
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
 
-# Recommended: Use markdown-it-py for better control and features
-from markdown_it import MarkdownIt
-from markdown_it.token import Token
-# from markdown_it.utils import read_normalize_str # Helper for reading file
+from src.core.article_model import Article, ContentElement, MediaPlaceholder
+from src.core import settings # Need settings for INPUT_DIR comparison
+from src.utils.logger import log
 
-# Alternative (simpler, less features):
-# import markdown
+# Regex to find the first H1 header (fallback title)
+TITLE_RE = re.compile(r"^\s*#\s+(.+)\s*$", re.MULTILINE)
 
-from src.core.article_model import (Article, ContentBlock, Heading, ImagePlaceholder,
-                                    Paragraph, CodeBlock, VideoPlaceholder, UnparsedBlock) # Add others as needed
+# Regex to find custom media placeholders like ![alt](placeholder:id)
+CUSTOM_MEDIA_PLACEHOLDER_RE = re.compile(r'!\[(.*?)\]\(placeholder:(.*?)\)')
 
-logger = logging.getLogger(__name__)
+# Regex to find standard Markdown image links: ![alt text](path/to/image.ext)
+# It should *not* match the custom placeholders.
+STANDARD_IMAGE_RE = re.compile(r'!\[(?P<alt>.*?)\]\((?P<path>(?!placeholder:).*?)\)')
+
+# Allowed image/video extensions (for simple type detection)
+MEDIA_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', # images
+                    '.mp4', '.mov', '.avi', '.wmv', '.mkv'} # videos (add more as needed)
 
 class MarkdownParser:
-    """Parses Markdown files into structured Article objects."""
+    """Parses Markdown files with frontmatter into a structured Article object."""
 
-    def __init__(self):
-        """Initializes the Markdown parser."""
-        # Configure markdown-it parser
-        # Enable desired features. 'linkify=True' automatically finds URLs.
-        # 'typographer=True' enables smart quotes, etc.
-        self.md = (
-            MarkdownIt('commonmark', {'breaks': True, 'html': False, 'linkify': True})
-            # .enable('table') # Enable tables if needed
-            .enable('strikethrough')
-            # Add plugins here if needed, e.g., for frontmatter
-        )
-        # Note: Handling frontmatter usually requires a plugin or separate parsing step before this.
-        logger.info("Markdown parser initialized (using markdown-it-py).")
-
-    def _get_absolute_media_path(self, media_path: str, md_file_dir: str) -> str:
+    def __init__(self, extensions: List[str] = None):
         """
-        Resolves the absolute path for a media file referenced in Markdown.
+        Initializes the Markdown parser.
 
         Args:
-            media_path (str): The path as written in the Markdown (e.g., "images/pic.jpg").
-            md_file_dir (str): The directory containing the Markdown file.
-
-        Returns:
-            str: The absolute path to the media file.
+            extensions (List[str]): List of python-markdown extensions to use.
+                                    Defaults to ['extra', 'fenced_code', 'tables', 'sane_lists'].
+                                    Consider making this configurable via settings.py.
         """
-        if os.path.isabs(media_path):
-            return media_path
-        # Simple check for web URLs (skip path joining)
-        if media_path.startswith(('http://', 'https://')):
-            return media_path
-        # Assume relative path from the Markdown file's directory
-        return os.path.abspath(os.path.join(md_file_dir, media_path))
+        self.extensions = extensions if extensions else ['extra', 'fenced_code', 'tables', 'sane_lists']
+        log.info(f"MarkdownParser initialized with extensions: {self.extensions}")
 
-
-    def parse_file(self, file_path: str) -> Article:
+    def parse_file(self, file_path: Path) -> Optional[Article]:
         """
-        Parses the Markdown file at the given path.
+        Parses a single Markdown file, including YAML frontmatter.
 
         Args:
-            file_path (str): The absolute or relative path to the Markdown file.
+            file_path (Path): The path to the Markdown file.
 
         Returns:
-            Article: The structured Article object.
-
-        Raises:
-            FileNotFoundError: If the markdown file does not exist.
-            Exception: For general parsing errors.
+            Optional[Article]: An Article object if parsing is successful, None otherwise.
         """
-        logger.info(f"Starting parsing of Markdown file: {file_path}")
-        if not os.path.exists(file_path):
-            logger.error(f"Markdown file not found: {file_path}")
-            raise FileNotFoundError(f"Markdown file not found: {file_path}")
+        if not file_path.is_file():
+            log.error(f"Markdown input file not found or is not a file: {file_path}")
+            return None
 
+        log.info(f"Starting parsing of Markdown file: {file_path}")
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Load the file, separating frontmatter (metadata) and content
+            post = frontmatter.load(file_path, encoding='utf-8')
+            metadata: Dict[str, Any] = post.metadata
+            raw_content: str = post.content
+            log.debug(f"Successfully loaded frontmatter. Metadata keys: {list(metadata.keys())}")
         except Exception as e:
-            logger.error(f"Error reading Markdown file {file_path}: {e}", exc_info=True)
-            raise
+            log.error(f"Error reading or parsing frontmatter/content from {file_path}: {e}")
+            return None
 
-        try:
-            # --- Optional: Frontmatter Parsing ---
-            # Use a library like 'python-frontmatter' here before parsing Markdown
-            # import frontmatter
-            # post = frontmatter.load(file_path)
-            # content = post.content
-            # metadata = post.metadata # Store this in Article.metadata
-            # logger.info(f"Parsed frontmatter metadata: {metadata}")
-            metadata = {} # Placeholder
+        # --- Extract Metadata ---
+        # Prioritize frontmatter, then H1, then filename for title
+        title = metadata.get('title')
+        if not title:
+            title = self._extract_h1_title(raw_content)
+            if title:
+                log.info("Using H1 header as title (no 'title' in frontmatter).")
+            else:
+                title = file_path.stem  # Fallback to filename
+                log.warning(f"No 'title' in frontmatter or H1 found. Using filename as title: '{title}'")
 
-            # --- Markdown Parsing ---
-            tokens: List[Token] = self.md.parse(content)
-            # logger.debug(f"Markdown Tokens: {[t.type for t in tokens]}") # For debugging
+        # Extract other relevant metadata
+        author = metadata.get('author')  # Get author from frontmatter, fallback if missing
+        if not author:
+            author = settings.ARTICLE_AUTHOR  # If author is missing, fallback to settings' default author
 
-            article_title = "Untitled Article" # Default title
-            content_blocks: List[ContentBlock] = []
-            md_file_dir = os.path.dirname(file_path)
+        custom_meta = {k: v for k, v in metadata.items() if k not in ['title', 'author', 'cover_image', 'cover_image_path']}  # Store other metadata
 
-            # --- Token Processing Logic ---
-            # This requires careful handling based on markdown-it's token stream.
-            # It's more complex than simple regex but more robust.
-            i = 0
-            first_heading_found = False
-            while i < len(tokens):
-                token = tokens[i]
-                # logger.debug(f"Processing token: {token.type} (Level: {token.level}, Tag: {token.tag}, Content: '{token.content}')")
+        # --- Identify Cover Image (from Frontmatter) ---
+        cover_image_placeholder_id = metadata.get('cover_image')  # Expects a placeholder ID
+        cover_image_path_str = metadata.get('cover_image_path')  # Expects a relative path string
+        article_cover_placeholder: Optional[MediaPlaceholder] = None
+        article_cover_path: Optional[str] = None  # Store relative path string
 
-                if token.type == 'heading_open':
-                    level = int(token.tag[1])
-                    inline_token = tokens[i+1] # Should be inline content
-                    if inline_token.type == 'inline' and inline_token.children:
-                        heading_text = inline_token.content.strip()
-                        if not first_heading_found:
-                            article_title = heading_text
-                            first_heading_found = True
-                            logger.debug(f"Extracted title (H{level}): {article_title}")
-                        else:
-                            content_blocks.append(Heading(level=level, text=heading_text))
-                            logger.debug(f"Added Heading block (H{level}): {heading_text}")
-                    i += 3 # Skip heading_open, inline, heading_close
-                    continue
-
-                elif token.type == 'paragraph_open':
-                    inline_token = tokens[i+1]
-                    if inline_token.type == 'inline':
-                        # Handle images within paragraphs separately
-                        if inline_token.children and any(t.type == 'image' for t in inline_token.children):
-                             for child_token in inline_token.children:
-                                 if child_token.type == 'image':
-                                     alt_text = child_token.content
-                                     src = child_token.attrs.get('src', '')
-                                     if src:
-                                         abs_path = self._get_absolute_media_path(src, md_file_dir)
-                                         # Simple check for video extensions
-                                         if any(src.lower().endswith(ext) for ext in ['.mp4', '.mov', '.avi']):
-                                             content_blocks.append(VideoPlaceholder(local_path=abs_path))
-                                             logger.debug(f"Added VideoPlaceholder block: {abs_path}")
-                                         else:
-                                             content_blocks.append(ImagePlaceholder(alt_text=alt_text, local_path=abs_path))
-                                             logger.debug(f"Added ImagePlaceholder block: {abs_path} (Alt: {alt_text})")
-                                     else:
-                                         logger.warning(f"Image tag found with no src: {child_token}")
-                                 elif child_token.content.strip(): # Add text between/around images as paragraphs
-                                    # This might split paragraphs unnaturally if text is complexly interleaved.
-                                    # A more sophisticated approach might group inline elements better.
-                                    para_text = child_token.content.strip()
-                                    content_blocks.append(Paragraph(text=para_text))
-                                    logger.debug(f"Added inline Paragraph block: {para_text[:50]}...")
-
-                        elif inline_token.content.strip(): # Regular paragraph text
-                            para_text = inline_token.content.strip()
-                            content_blocks.append(Paragraph(text=para_text))
-                            logger.debug(f"Added Paragraph block: {para_text[:50]}...")
-                    i += 3 # Skip paragraph_open, inline, paragraph_close
-                    continue
-
-                elif token.type == 'fence': # Code blocks (```)
-                    lang = token.info.strip() if token.info else None
-                    code = token.content.strip()
-                    content_blocks.append(CodeBlock(language=lang, code=code))
-                    logger.debug(f"Added Code block (lang: {lang}): {code[:50]}...")
-                    i += 1
-                    continue
-
-                # Add handlers for other block types: lists, blockquotes, tables etc.
-                # elif token.type == 'bullet_list_open': ...
-                # elif token.type == 'blockquote_open': ...
-
-                else:
-                    # Optional: Capture unhandled blocks if needed
-                    # if token.content.strip():
-                    #    content_blocks.append(UnparsedBlock(raw_content=token.content))
-                    # logger.debug(f"Unhandled token type: {token.type}")
-                    i += 1 # Move to the next token
-
-            # --- Create Article Object ---
-            article = Article(
-                title=article_title,
-                content_blocks=content_blocks,
-                source_path=os.path.abspath(file_path),
-                metadata=metadata # Add parsed frontmatter here
+        if cover_image_placeholder_id:
+            log.info(f"Identified cover image via frontmatter 'cover_image' placeholder ID: '{cover_image_placeholder_id}'")
+            # Create a placeholder object; the uploader will find the actual file
+            article_cover_placeholder = MediaPlaceholder(
+                original_tag=f"frontmatter:cover_image:{cover_image_placeholder_id}",
+                placeholder_id=cover_image_placeholder_id,
+                media_type="thumb",  # Assume thumb for cover
+                alt_text="Cover Image"
             )
-            logger.info(f"Successfully parsed Markdown. Title: '{article.title}'. Blocks found: {len(content_blocks)}")
-            return article
+        elif cover_image_path_str:
+            log.info(f"Identified cover image via frontmatter 'cover_image_path': '{cover_image_path_str}'")
+            # Store the path; uploader will resolve and use it
+            article_cover_path = cover_image_path_str
+            # Optionally create a placeholder too, using filename as ID?
+            cover_filename = Path(cover_image_path_str).name
+            article_cover_placeholder = MediaPlaceholder(
+                original_tag=f"frontmatter:cover_image_path:{cover_image_path_str}",
+                placeholder_id=cover_filename,  # Use filename as ID
+                media_type="thumb",
+                alt_text="Cover Image",
+                file_path=article_cover_path  # Store relative path here
+            )
+        else:
+            log.warning(f"No 'cover_image' (placeholder ID) or 'cover_image_path' found in frontmatter for {file_path.name}. Cover image must be handled manually or by convention in uploader.")
 
+        # --- Identify Media Placeholders in Content ---
+        # Combine custom placeholders and standard Markdown images found
+        media_placeholders = self._extract_media_placeholders(raw_content, file_path.parent)
+
+        # --- Convert Markdown Content to HTML ---
+        try:
+            html_content = markdown.markdown(raw_content, extensions=self.extensions)
+            log.debug(f"Markdown content converted to HTML for {file_path.name}")
         except Exception as e:
-            logger.error(f"Failed to parse Markdown file {file_path}: {e}", exc_info=True)
-            # Re-raise or return a default/empty Article object depending on desired behavior
-            raise
+            log.error(f"Error converting Markdown content to HTML for {file_path.name}: {e}")
+            return None  # Cannot proceed without HTML content
+
+        # --- Create Article Object ---
+        content_elements = [ContentElement(type='html', content=None, html_content=html_content)]
+        article = Article(
+            title=title,
+            content_elements=content_elements,
+            media_placeholders=media_placeholders,
+            raw_markdown=raw_content,  # Keep raw MD content if needed
+            metadata={**custom_meta, 'author': author},  # Combine custom meta with author
+            cover_image_placeholder=article_cover_placeholder,
+            cover_image_file_path=article_cover_path  # This is the *relative* path string from frontmatter
+        )
+
+        log.info(f"Successfully parsed Markdown file: '{file_path.name}'. Title: '{article.title}'. Found {len(media_placeholders)} content media references.")
+        return article
+
+    def _extract_h1_title(self, text: str) -> Optional[str]:
+        """Extracts the first H1 header as the title."""
+        match = TITLE_RE.search(text)
+        if match:
+            title = match.group(1).strip()
+            log.debug(f"Extracted H1 title: '{title}'")
+            return title
+        return None
+
+    def _get_media_type_from_path(self, path_str: str) -> str:
+         """Determines media type (image/video) based on file extension."""
+         ext = Path(path_str).suffix.lower()
+         if ext in MEDIA_EXTENSIONS:
+             # Basic check, could be refined (e.g., differentiate thumb/image if needed)
+             return "video" if any(path_str.lower().endswith(vidext) for vidext in ['.mp4', '.mov', '.avi']) else "image"
+         return "image" # Default to image if extension unknown/missing
+
+    def _extract_media_placeholders(self, text: str, base_dir: Path) -> List[MediaPlaceholder]:
+        """
+        Finds all media placeholders in the text, including custom `placeholder:` syntax
+        and standard Markdown image/video links pointing to relative paths.
+
+        Args:
+            text (str): The Markdown content string.
+            base_dir (Path): The directory containing the Markdown file, used for
+                             resolving relative paths.
+
+        Returns:
+            List[MediaPlaceholder]: A list of identified media placeholders.
+        """
+        placeholders = []
+        found_ids_or_paths = set()  # Track both IDs and resolved paths to avoid duplicates
+
+        # 1. Find custom ![alt](placeholder:id) tags
+        for match in CUSTOM_MEDIA_PLACEHOLDER_RE.finditer(text):
+            original_tag = match.group(0)
+            alt_text = match.group(1).strip()
+            placeholder_id = match.group(2).strip()
+
+            if not placeholder_id:
+                log.warning(f"Found custom placeholder with empty ID: {original_tag}. Skipping.")
+                continue
+
+            if placeholder_id in found_ids_or_paths:
+                log.warning(f"Duplicate media placeholder ID found: '{placeholder_id}'. Skipping subsequent occurrences.")
+                continue
+
+            media_type = self._get_media_type_from_path(placeholder_id)  # Infer from ID extension
+
+            placeholder = MediaPlaceholder(
+                original_tag=original_tag,
+                placeholder_id=placeholder_id,
+                alt_text=alt_text,
+                media_type=media_type,
+                file_path=None  # Path needs to be found by uploader based on ID
+            )
+            placeholders.append(placeholder)
+            found_ids_or_paths.add(placeholder_id)
+            log.debug(f"Found custom media placeholder: ID='{placeholder_id}', Type='{media_type}', Alt='{alt_text}'")
+
+        # 2. Find standard ![alt](path/to/media.ext) tags
+        for match in STANDARD_IMAGE_RE.finditer(text):
+            original_tag = match.group(0)
+            alt_text = match.group('alt').strip()
+            relative_path_str = match.group('path').strip()
+
+            if not relative_path_str:
+                log.warning(f"Found standard image tag with empty path: {original_tag}. Skipping.")
+                continue
+
+            # Resolve the relative path based on the Markdown file's location
+            # Note: This assumes the path is relative to the MD file itself.
+            # If paths are relative to INPUT_DIR, adjust base_dir accordingly.
+            try:
+                # Security: Prevent path traversal beyond input dir? Maybe not needed if trusted source.
+                absolute_path = (base_dir / relative_path_str).resolve()
+                # For consistency, store the *original* relative path found in the MD
+                stored_path_str = relative_path_str
+            except Exception as e:
+                log.warning(f"Could not resolve path '{relative_path_str}' from tag {original_tag}: {e}. Skipping.")
+                continue
+
+            if stored_path_str in found_ids_or_paths:
+                 log.warning(f"Duplicate media path found: '{stored_path_str}'. Skipping subsequent occurrences.")
+                 continue
+
+            # Use filename as the placeholder ID for standard links
+            placeholder_id = Path(stored_path_str).name
+            media_type = self._get_media_type_from_path(stored_path_str)
+
+            # Optional: Check if the resolved path actually exists here?
+            # if not absolute_path.is_file():
+            #     log.warning(f"Standard media file reference points to non-existent file: '{absolute_path}' from tag {original_tag}. Still creating placeholder.")
+            # We'll let the uploader handle the actual file existence check.
+
+            placeholder = MediaPlaceholder(
+                original_tag=original_tag,
+                placeholder_id=placeholder_id,  # Use filename as ID
+                alt_text=alt_text,
+                media_type=media_type,
+                file_path=stored_path_str  # Store the ORIGINAL relative path string
+            )
+            placeholders.append(placeholder)
+            found_ids_or_paths.add(stored_path_str)
+            log.debug(f"Found standard media reference: Path='{stored_path_str}', ID='{placeholder_id}', Type='{media_type}', Alt='{alt_text}'")
+
+        return placeholders
 
 
-# --- Explanation ---
-# Purpose: Converts raw Markdown text into a structured `Article` object using the
-#          definitions from `article_model.py`.
-# Design Choices:
-# - Uses `markdown-it-py` (recommended) which provides a token stream. Processing
-#   tokens is more complex than regex but handles nested structures and edge cases
-#   more reliably. A simpler `markdown` library could be used initially but might
-#   struggle with complex content or identifying blocks cleanly.
-# - Defines a `MarkdownParser` class to encapsulate parsing logic.
-# - Includes a helper `_get_absolute_media_path` to resolve relative image/video paths
-#   correctly based on the Markdown file's location. It also handles web URLs.
-# - Iterates through the token stream, identifying headings, paragraphs, images,
-#   code blocks, etc., and mapping them to the corresponding `ContentBlock` objects.
-# - Extracts the first H1 heading as the article title.
-# - Populates the `Article` object and returns it.
-# - Includes basic error handling for file reading and parsing.
-# - Placeholder logic for handling videos based on file extension (could be improved).
-# Improvements/Alternatives:
-# - **Robustness:** The token processing logic needs refinement to handle all edge cases,
-#   nested elements (like images inside links), lists, blockquotes, tables, etc.
-#   This is the most complex part of this module.
-# - **Frontmatter:** Integrate a library like `python-frontmatter` to parse metadata
-#   at the beginning of the file (e.g., title, author, custom tags).
-# - **Library Choice:** Evaluate different Markdown libraries (`mistune`, `commonmark`)
-#   based on specific needs for syntax support and ease of extracting structured data.
-# - **Video Handling:** Use a more reliable way to distinguish videos (e.g., specific
-#   Markdown syntax like `![video](path.mp4)` or frontmatter flags).
+# Example Usage (demonstration - assuming settings.py exists)
+if __name__ == '__main__':
+    # Create dummy files and directories for testing
+    dummy_dir = Path("./temp_parser_test")
+    dummy_dir.mkdir(exist_ok=True)
+    (dummy_dir / "images").mkdir(exist_ok=True)
+
+    dummy_md_content = """---
+title: My Awesome Article Title
+author: Test Author
+cover_image: cover_placeholder.jpg
+# cover_image_path: cover/my_cover.png # Alternative way to specify cover
+custom_field: some_value
+---
+
+# This H1 will be ignored if title exists in frontmatter
+
+This is the first paragraph.
+
+![Custom placeholder img](placeholder:content_img_1.png)
+
+Here is a standard image link:
+![Standard cat image](./images/cat.gif)
+
+Another paragraph.
+
+![Another custom one](placeholder:video1.mp4)
+
+![Duplicate standard path](./images/cat.gif)
+![Duplicate placeholder ID](placeholder:content_img_1.png)
+
+End.
+"""
+    test_file = dummy_dir / "test_article.md"
+    test_file.write_text(dummy_md_content, encoding='utf-8')
+    (dummy_dir / "images" / "cat.gif").touch() # Create dummy image file
+
+    # Mock settings needed for the example run
+    class MockSettings:
+        ARTICLE_AUTHOR = "Default Config Author"
+        INPUT_DIR = dummy_dir # Make paths relative to test dir
+
+    # Replace actual settings import for example run - IN REAL CODE, USE ACTUAL IMPORT
+    import sys
+    sys.modules['src.core.settings'] = MockSettings
+
+    parser = MarkdownParser()
+    parsed_article = parser.parse_file(test_file)
+
+    if parsed_article:
+        print(f"\n--- Parsed Article ---")
+        print(f"Title: {parsed_article.title}")
+        print(f"Metadata: {parsed_article.metadata}")
+        print(f"Cover Placeholder ID: {parsed_article.cover_image_placeholder.placeholder_id if parsed_article.cover_image_placeholder else 'None'}")
+        print(f"Cover File Path (relative): {parsed_article.cover_image_file_path if parsed_article.cover_image_file_path else 'None'}")
+
+        print(f"\nContent Media Placeholders ({len(parsed_article.media_placeholders)}):")
+        for p in parsed_article.media_placeholders:
+            print(f"- ID: {p.placeholder_id:<20} Type: {p.media_type:<7} Path: {p.file_path:<20} Alt: {p.alt_text:<20} Tag: {p.original_tag}")
+
+        print(f"\nHTML Content (first 200 chars):\n{parsed_article.content_elements[0].html_content[:200]}...")
+
+    # Clean up
+    import shutil
+    shutil.rmtree(dummy_dir)

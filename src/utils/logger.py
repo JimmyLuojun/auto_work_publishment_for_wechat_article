@@ -1,145 +1,70 @@
-# -*- coding: utf-8 -*-
-"""
-logger.py - Configures application-wide logging.
+# /Users/junluo/Documents/auto_work_publishment_for_wechat_article/src/utils/logger.py
 
-Responsibilities:
-- Set up the root logger with appropriate level, format, and handlers.
-- Centralize logging configuration for consistency.
+"""
+Logger Configuration Module
+
+Purpose:
+Initializes and configures a centralized logger for the application.
+Provides a consistent logging format and level across different modules.
 
 Dependencies:
-- logging: Standard Python logging library.
-- logging.config: For dictionary-based configuration (optional but flexible).
-- os: To construct file paths.
+- logging (standard Python library)
 
-Expected Input: Optionally, configuration settings (e.g., log level, file path).
-Expected Output: None (Configures the logging system).
+Expected Input: None
+Expected Output: A configured logging.Logger instance.
 """
 
 import logging
-import logging.config
-import os
-from typing import Dict, Any
+import sys
 
-# Assumes logger.py is in src/utils/
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+LOG_LEVEL = logging.INFO  # Default level, can be configured externally if needed
 
-DEFAULT_LOG_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "standard": {
-            "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S",
-        },
-        "detailed": {
-            "format": "%(asctime)s - %(name)s:%(lineno)d - %(levelname)s - %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S",
-        },
-    },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "level": "INFO", # Default console level
-            "formatter": "standard",
-            "stream": "ext://sys.stdout", # Use stdout
-        },
-        "file": {
-            "class": "logging.handlers.RotatingFileHandler",
-            "level": "DEBUG", # Default file level (more verbose)
-            "formatter": "detailed",
-            "filename": os.path.join(PROJECT_ROOT, "app.log"), # Default log file name
-            "maxBytes": 10485760,  # 10MB
-            "backupCount": 3,
-            "encoding": "utf8",
-        },
-    },
-    "loggers": {
-        "": { # Root logger
-            "handlers": ["console", "file"],
-            "level": "DEBUG", # Set root logger level to lowest (handlers control output)
-            "propagate": False, # Avoid duplicating messages if other loggers are configured
-        },
-        # Example: Quieter logging for noisy libraries
-        "requests": {
-            "handlers": ["console", "file"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-         "urllib3": {
-            "handlers": ["console", "file"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-    },
-}
-
-def setup_logging(settings: Dict[str, Any] = None):
+def setup_logger(name: str = 'wechat_publisher', level: int = LOG_LEVEL) -> logging.Logger:
     """
-    Configures the logging system using a dictionary configuration.
+    Configures and returns a logger instance.
 
     Args:
-        settings (Dict[str, Any], optional): Application settings dictionary.
-                                             Can override defaults like log level/file path.
-                                             Defaults to None.
+        name (str): The name of the logger, typically the module name.
+        level (int): The logging level (e.g., logging.INFO, logging.DEBUG).
+
+    Returns:
+        logging.Logger: The configured logger instance.
     """
-    config = DEFAULT_LOG_CONFIG.copy() # Start with defaults
+    logger = logging.getLogger(name)
 
-    # Override defaults using application settings if provided
-    if settings:
-        log_settings = settings.get('logging', {})
-        log_level_str = log_settings.get('level', 'INFO').upper()
-        log_level = getattr(logging, log_level_str, logging.INFO)
+    # Prevent adding multiple handlers if called multiple times
+    if not logger.handlers:
+        logger.setLevel(level)
 
-        # Update handler levels
-        config['handlers']['console']['level'] = log_level_str
-        # Keep file logging potentially more verbose unless specified otherwise
-        config['handlers']['file']['level'] = log_settings.get('file_level', 'DEBUG').upper()
+        # Console Handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(level)
 
-        # Update root logger level if needed (usually DEBUG is fine if handlers filter)
-        # config['loggers']['']['level'] = log_level_str
+        # Formatter
+        formatter = logging.Formatter(LOG_FORMAT)
+        console_handler.setFormatter(formatter)
 
-        # Update log file path
-        paths_settings = settings.get('paths', {})
-        log_file = paths_settings.get('log_file', 'app.log')
-        # Ensure log file path is absolute or relative to project root
-        if not os.path.isabs(log_file):
-            log_file = os.path.join(PROJECT_ROOT, log_file)
-        config['handlers']['file']['filename'] = log_file
-        # Create log directory if it doesn't exist
-        log_dir = os.path.dirname(log_file)
-        if log_dir and not os.path.exists(log_dir):
-             try:
-                 os.makedirs(log_dir)
-             except OSError as e:
-                 logging.error(f"Could not create log directory {log_dir}: {e}")
+        # Add handler to logger
+        logger.addHandler(console_handler)
 
+        # Optional: File Handler (Uncomment if needed)
+        # try:
+        #     # Ensure the output directory exists if logging to a file
+        #     log_file_path = 'app.log' # Consider making this configurable
+        #     file_handler = logging.FileHandler(log_file_path)
+        #     file_handler.setLevel(level)
+        #     file_handler.setFormatter(formatter)
+        #     logger.addHandler(file_handler)
+        # except Exception as e:
+        #     logger.warning(f"Could not configure file handler: {e}")
 
-    try:
-        logging.config.dictConfig(config)
-        logging.info("Logging configured successfully.")
-        logging.debug(f"Log file path: {config['handlers']['file']['filename']}")
-        logging.debug(f"Console log level: {config['handlers']['console']['level']}")
-        logging.debug(f"File log level: {config['handlers']['file']['level']}")
-    except Exception as e:
-        # Fallback to basic config if dictConfig fails
-        logging.basicConfig(level=logging.INFO)
-        logging.error(f"Error configuring logging with dictConfig: {e}. Falling back to basicConfig.", exc_info=True)
+    return logger
 
+# Initialize a default logger instance for easy import
+log = setup_logger()
 
-# --- Explanation ---
-# Purpose: To provide a single point of configuration for logging across the
-#          entire application, ensuring consistent format and output destinations.
-# Design Choices:
-# - Uses `logging.config.dictConfig` which is flexible for defining formatters,
-#   handlers (console, rotating file), and levels for different loggers.
-# - Defines default settings but allows overrides via the main `settings` dict.
-# - Configures a console handler (for immediate feedback) and a rotating file
-#   handler (for persistent, detailed logs).
-# - Sets different default levels for console (INFO) and file (DEBUG) handlers.
-# - Quiets down noisy libraries like `requests` by default.
-# - Includes basic error handling for configuration and directory creation.
-# Improvements/Alternatives:
-# - Could add more handlers (e.g., SysLogHandler, HTTPHandler) if needed.
-# - Could use environment variables directly for log level overrides.
-# - For very complex scenarios, external logging configuration files (JSON, YAML)
-#   could be loaded.
+# Example Usage (in other modules):
+# from src.utils.logger import log
+# log.info("This is an info message.")
+# log.error("This is an error message.")

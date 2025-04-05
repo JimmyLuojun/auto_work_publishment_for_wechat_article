@@ -1,8 +1,13 @@
-# Python
+# --- Python ---
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -19,42 +24,71 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# Virtual Environment
-venv/
-env/
-ENV/
-.env
-.venv
+# PyInstaller
+# Usually these files are created by pyinstaller, if you are using it.
+*.manifest
+*.spec
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-.DS_Store
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Logs
-*.log
-logs/
-
-# Local development settings
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Database
-*.db
-*.sqlite3
-
-# Coverage reports
+# Unit test / coverage reports
 htmlcov/
 .tox/
+.nox/
 .coverage
 .coverage.*
 .cache
 nosetests.xml
 coverage.xml
 *.cover
-.hypothesis/ 
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE settings directories
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# --- Project Specific ---
+
+# Secrets Management (Crucial!)
+# Ignore the directory containing secret files or the .env file itself
+secrets/
+*.env
+.env.*
+!*.env.example # Allow example env files
+
+# Configuration (If it contains user-specific paths or sensitive defaults)
+# Often better to commit a config.ini.template and ignore the actual config.ini
+config.ini
+
+# Output Data
+data/output/
+*.log
+app.log # Example log file name
+
+# Generated media (if using API generation mode)
+# data/output/generated_images/ # Keep generated images for review? Comment out if ignoring needed.
+
+# Temporary Test Files (if any)
+temp_*.md
+temp_parser_test/ # Directory created by parser example
+
+# OS generated files
+.DS_Store
+Thumbs.db
